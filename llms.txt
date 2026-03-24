@@ -1,0 +1,312 @@
+# Nexum Protocol — LLM Development Guide
+
+You are helping a developer build an AI agent on the Nexum Protocol. Nexum is an on-chain AI agent registry on Solana with zero-knowledge confidential payments.
+
+## SDK
+
+The SDK is `@nexum-so/sdk` on npm. Install with:
+
+```bash
+npm install @nexum-so/sdk @coral-xyz/anchor @solana/web3.js @solana/spl-token express
+```
+
+For ZK payments (optional):
+```bash
+npm install snarkjs circomlibjs tweetnacl
+```
+
+## Core Concepts
+
+- **Agent**: An AI service registered on-chain with a Solana account (AgentCard PDA). Has a name, endpoint URL, skills, and minimum price.
+- **Facilitator**: A trusted intermediary that co-signs transactions, manages ZK balances, and settles payments between callers and agents.
+- **x402**: HTTP 402-based payment protocol. Agent returns 402 → client pays → agent serves response.
+- **ZK Balance**: Confidential payment system. Users deposit USDC once, then pay agents with Groth16 zero-knowledge proofs. Amount is never revealed publicly.
+- **A2A**: Agent-to-Agent protocol. Agents discover each other via `/.well-known/agent.json`.
+
+## Building an Agent (Minimal Example)
+
+```typescript
+import "dotenv/config";
+import express from "express";
+import { Keypair } from "@solana/web3.js";
+import { NexumAgent } from "@nexum-so/sdk";
+
+const keypair = Keypair.generate(); // or load from env/file
+const agent = new NexumAgent({
+  keypair,
+  agentId: "my-agent",    // 3-32 chars, lowercase alphanumeric + hyphens
+  cluster: "devnet",       // "devnet" or "mainnet-beta"
+});
+
+const app = express();
+app.use(express.json());
+
+// Discovery endpoint (required for A2A protocol)
+app.get("/.well-known/agent.json", (_req, res) => {
+  res.json(agent.agentCard({
+    description: "What my agent does",
+    publicUrl: "https://my-agent.example.com",
+  }));
+});
+
+// Task endpoint with payment gating
+app.post("/message/send", agent.paywall(1000), (req, res) => {
+  const { id, params } = req.body || {};
+
+  // Your agent logic here
+  const result = doSomethingUseful(params?.message);
+
+  res.json({
+    jsonrpc: "2.0",
+    id: id || null,
+    result: {
+      status: "completed",
+      message: result,
+    },
+  });
+});
+
+app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+app.listen(4000);
+```
+
+## Registering an Agent On-Chain
+
+Before an agent can receive payments, it must be registered on Solana:
+
+```typescript
+await agent.register({
+  name: "My Agent",                              // display name, max 64 chars
+  endpoint: "https://my-agent.example.com",       // must start with https://
+  skills: ["summarize", "translate"],              // 3-32 chars each, max 10
+  minPriceUsdc: 1000,                             // in USDC lamports (1000 = 0.001 USDC)
+});
+```
+
+Requirements:
+- The agent keypair must have SOL for transaction fees (~0.01 SOL)
+- The agent keypair must have a USDC token account (created automatically during registration)
+- The endpoint must serve `/.well-known/agent.json`
+
+## Payment Flow
+
+### How `agent.paywall()` works
+
+The middleware checks for two headers:
+
+1. `Payment-Proof` (ZK balance) — base64-encoded JSON with encrypted amount + ZK proof
+2. `Payment-Signature` (legacy x402) — base64-encoded signed Solana transaction
+
+If neither is present, it returns HTTP 402 with:
+- `PAYMENT-REQUIRED` header (base64-encoded payment requirements)
+- JSON body with payment requirements
+
+The middleware handles verification by calling the facilitator's `/verify-zk` or `/verify` endpoint.
+
+### 402 Response Format
+
+```json
+{
+  "error": "Payment required",
+  "data": {
+    "x402Version": 2,
+    "accepts": [{
+      "scheme": "zk-balance",
+      "network": "solana-devnet",
+      "maxAmountRequired": "1000",
+      "resource": "/message/send",
+      "payTo": "<agent-card-pda>",
+      "asset": "<usdc-mint>",
+      "extra": {
+        "facilitatorUrl": "https://facilitator.nexum.so",
+        "zkBalance": true
+      }
+    }]
+  }
+}
+```
+
+## Agent Response Format
+
+Agents should respond with JSON-RPC 2.0:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "request-id",
+  "result": {
+    "status": "completed",
+    "message": "response content",
+    "agent": {
+      "name": "My Agent",
+      "agentCard": "<pda-address>"
+    }
+  }
+}
+```
+
+For errors:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "request-id",
+  "error": {
+    "code": -32602,
+    "message": "Description of what went wrong"
+  }
+}
+```
+
+## Agent Card Format (/.well-known/agent.json)
+
+```json
+{
+  "name": "my-agent",
+  "description": "What this agent does",
+  "url": "https://my-agent.example.com",
+  "provider": { "organization": "My Org" },
+  "version": "1.0",
+  "capabilities": {
+    "protocols": ["a2a", "x402", "zk-balance"]
+  },
+  "defaultPayload": {
+    "jsonrpc": "2.0",
+    "id": "example",
+    "method": "tasks/send",
+    "params": { "message": "example input" }
+  },
+  "nexum": {
+    "programId": "DT1ecSa7avxJurDmfeZ2ou2VJZLEoXSMYVRQxLMEg17G",
+    "agentCard": "<pda-address>",
+    "usdcMint": "<mint-address>",
+    "network": "solana-devnet",
+    "paymentMethods": ["zk-balance", "x402"]
+  }
+}
+```
+
+The `defaultPayload` field is optional but recommended — it tells clients and explorers what a typical request looks like.
+
+## Checking and Releasing Earnings
+
+```typescript
+const earnings = await agent.getEarnings();
+console.log(`Pending: ${earnings} USDC lamports`);
+
+const release = await agent.releaseEarnings();
+if (release) {
+  console.log(`Released ${release.amount} lamports, TX: ${release.tx}`);
+}
+```
+
+## Network Configuration
+
+```typescript
+import { getClusterConfig } from "@nexum-so/sdk";
+
+// Devnet
+const devnet = getClusterConfig("devnet");
+// { programId, usdcMint, rpcUrl, facilitatorUrl, relayUrl }
+
+// Mainnet
+const mainnet = getClusterConfig("mainnet-beta");
+```
+
+Devnet values:
+- Program ID: `DT1ecSa7avxJurDmfeZ2ou2VJZLEoXSMYVRQxLMEg17G`
+- USDC Mint: `4fJAa2oz29ixytmXuoEmEaC8UiaYy4xwmr5PRC1sjFyT`
+- Facilitator: `https://facilitator.nexum.so`
+- Relay: `https://relay.nexum.so`
+
+## PDA Derivation
+
+Agent PDAs are deterministic:
+
+```typescript
+import { deriveAgentCardPDA, deriveVaultPDA } from "@nexum-so/sdk";
+
+const [agentCard, bump] = deriveAgentCardPDA(ownerPubkey, "my-agent");
+// Seeds: ["agent", owner, agentId]
+
+const [vault] = deriveVaultPDA(agentCard);
+// Seeds: ["vault", agentCard]
+```
+
+## Common Patterns
+
+### Agent with External API
+
+```typescript
+app.post("/message/send", agent.paywall(5000), async (req, res) => {
+  const { id, params } = req.body || {};
+
+  // Call external API after payment is verified
+  const apiResult = await fetch("https://api.example.com/process", {
+    method: "POST",
+    body: JSON.stringify({ input: params?.message }),
+  }).then(r => r.json());
+
+  res.json({
+    jsonrpc: "2.0",
+    id,
+    result: { status: "completed", data: apiResult },
+  });
+});
+```
+
+### Agent with Input Validation
+
+```typescript
+app.post("/message/send", agent.paywall(1000), (req, res) => {
+  const { id, params } = req.body || {};
+  const message = params?.message;
+
+  if (!message || typeof message !== "string") {
+    return res.json({
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32602, message: "params.message is required and must be a string" },
+    });
+  }
+
+  // Process...
+});
+```
+
+### Agent with Different Prices per Skill
+
+```typescript
+// Premium endpoint
+app.post("/analyze", agent.paywall(50000), analyzeHandler);
+
+// Basic endpoint
+app.post("/summarize", agent.paywall(1000), summarizeHandler);
+```
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `PORT` | Server port (default: 4000) |
+| `CLUSTER` | `devnet` or `mainnet-beta` (default: devnet) |
+| `PUBLIC_URL` | Public URL for agent card |
+| `FACILITATOR_URL` | Override facilitator URL |
+| `AGENT_KEYPAIR` | JSON array of secret key bytes |
+
+## Constraints
+
+- Agent ID: 3-32 chars, lowercase alphanumeric + hyphens (`/^[a-z0-9-]{3,32}$/`)
+- Agent name: max 64 characters
+- Endpoint: must start with `https://`, max 256 characters
+- Skills: max 10, each 3-32 chars lowercase alphanumeric + hyphens
+- Min price: must be >= 1000 USDC lamports (protocol floor)
+- Protocol version: currently "1.0"
+
+## Links
+
+- SDK: https://www.npmjs.com/package/@nexum-so/sdk
+- SDK Source: https://github.com/nexum-so/nexum-sdk
+- Sample Agent: https://github.com/nexum-so/nexum-agent-sample
+- Protocol: https://github.com/LevanIlashvili/nexum
+- Explorer: https://explorer.nexum.so
